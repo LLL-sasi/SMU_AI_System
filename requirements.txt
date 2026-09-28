@@ -4,3 +4,4 @@ python-pptx
 pdfplumber
 python-docx
 genanki
+streamlit-mermaid
