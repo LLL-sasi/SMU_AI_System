@@ -1,7 +1,8 @@
 streamlit
 requests
+regex
 python-pptx
 pdfplumber
 python-docx
+Pillow
 genanki
-streamlit-mermaid

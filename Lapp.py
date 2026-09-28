@@ -1,11 +1,14 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
-import re
+import regex as re
 import os
 import base64
 import json
 import time
 import io
+import concurrent.futures
+from PIL import Image
 import genanki
 from datetime import datetime
 from pptx import Presentation
@@ -13,20 +16,12 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 import pdfplumber
 from docx import Document
 
-# 引入Mermaid渲染库
-try:
-    from streamlit_mermaid import st_mermaid
-
-    HAS_MERMAID = True
-except ImportError:
-    HAS_MERMAID = False
-
 # ==================== 1. 配置 API ====================
-DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", "sk-你的本地测试DeepSeek Key")
+# 替换为云端安全读取
+DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-ZHIPU_API_KEY = st.secrets.get("ZHIPU_API_KEY", "你的本地测试智谱Key")
+ZHIPU_API_KEY = st.secrets.get("ZHIPU_API_KEY", "")
 ZHIPU_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-
 # ==================== 2. 状态初始化 ====================
 if 'last_analysis' not in st.session_state: st.session_state['last_analysis'] = ""
 if 'last_mistake_diagnosis' not in st.session_state: st.session_state['last_mistake_diagnosis'] = ""
@@ -65,10 +60,16 @@ def generate_apkg(csv_text):
                                  templates=[{'name': 'Medical_Card', 'qfmt': '{{Front}}',
                                              'afmt': '{{FrontSide}}<hr id="answer">{{Back}}'}])
         my_deck = genanki.Deck(2059400110, 'SMU_AI_Medical_Deck')
+        valid_cards = 0
+        # 按行分割，每行一张卡片
         for line in csv_text.strip().split('\n'):
-            parts = line.split('|')
-            if len(parts) >= 2: my_deck.add_note(
-                genanki.Note(model=my_model, fields=[parts[0].strip(), parts[1].strip()]))
+            if "|" not in line: continue
+            parts = line.split('|', 1)
+            if len(parts) >= 2:
+                my_deck.add_note(
+                    genanki.Note(model=my_model, fields=[parts[0].strip(), parts[1].strip()]))
+                valid_cards += 1
+        if valid_cards == 0: return None
         apkg_buffer = io.BytesIO()
         genanki.Package(my_deck).write_to_file(apkg_buffer)
         apkg_buffer.seek(0)
@@ -77,7 +78,7 @@ def generate_apkg(csv_text):
         return None
 
 
-# ==================== 5. 图片识别与文本提取 ====================
+# ==================== 5. 图片识别与文本提取（性能优化版） ====================
 def describe_image_with_glm(base64_image):
     prompt = """你是一名专业的医学助教。请详细描述这张医学图片（如通路图、解剖图、机制图等）的核心内容，包括：1. 图中展示的主要结构和分子机制；2. 图中的关键节点和信号流向；3. 图中标注的文字和符号。请用专业、精炼的医学语言描述。"""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {ZHIPU_API_KEY}"}
@@ -95,29 +96,51 @@ def describe_image_with_glm(base64_image):
         return f"[图片识别失败: {str(e)}]"
 
 
+def process_single_image(shape):
+    try:
+        image_bytes = shape.image.blob
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.width > 1000:
+            ratio = 1000 / image.width
+            new_size = (1000, int(image.height * ratio))
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format="JPEG", quality=85)
+        base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        return describe_image_with_glm(base64_image)
+    except Exception:
+        return None
+
+
 def extract_ppt_with_images(uploaded_file):
     prs = Presentation(uploaded_file)
     full_text = ""
-    image_count = 0
+    total_images = 0
     for slide in prs.slides:
         slide_text = ""
-        slide_images_desc = ""
+        picture_shapes = []
         for shape in slide.shapes:
-            if shape.has_text_frame: slide_text += shape.text_frame.text + "\n"
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                try:
-                    image_bytes = shape.image.blob
-                    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                    with st.spinner(f"正在识别第{image_count + 1}张图片..."):
-                        img_desc = describe_image_with_glm(base64_image)
-                    slide_images_desc += f"\n【图片{image_count + 1}内容描述】\n{img_desc}\n"
-                    image_count += 1
-                    time.sleep(0.5)
-                except Exception as e:
-                    slide_images_desc += f"\n[图片{image_count + 1}识别失败: {str(e)}]\n"
-                    image_count += 1
+            try:
+                if hasattr(shape, "text_frame") and shape.has_text_frame:
+                    slide_text += shape.text_frame.text + "\n"
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE and shape.width > 1828800:
+                    picture_shapes.append(shape)
+            except Exception:
+                continue
+
+        slide_images_desc = ""
+        if picture_shapes:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(process_single_image, shape) for shape in picture_shapes]
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    res = future.result()
+                    if res:
+                        slide_images_desc += f"\n【图片{total_images + i + 1}内容描述】\n{res}\n"
+            total_images += len(picture_shapes)
         full_text += slide_text + slide_images_desc + "\n---\n"
-    if image_count > 0: st.sidebar.success(f"PPT解析完成！识别了{image_count}张图片。")
+    if total_images > 0: st.sidebar.success(f"PPT解析完成！智能识别了{total_images}张关键图片。")
     return full_text.strip()
 
 
@@ -125,7 +148,7 @@ def extract_text_from_file(uploaded_file):
     if uploaded_file.name.endswith('.pptx'):
         return extract_ppt_with_images(uploaded_file)
     elif uploaded_file.name.endswith('.docx'):
-        doc = Document(uploaded_file);
+        doc = Document(uploaded_file)
         text = ""
         for para in doc.paragraphs: text += para.text + "\n"
         return text.strip()
@@ -176,28 +199,35 @@ def get_ai_response(ppt_text, audio_text, mode, work_mode="微观伴读模式", 
         with st.spinner("🌐 正在检索 PubMed 最新文献..."):
             pubmed_context = f"\n【PubMed最新文献参考】\n{search_pubmed(ppt_text[:100])}\n"
 
-    hallucination_rule = "\n【防幻觉与对比要求】1. 所有结论必须优先基于我提供的PPT文本和参考资料，若没有找到明确依据，必须加上“⚠️ 此内容为AI补充，请以教材为准”。2. 若遇到易混淆的医学名词（如渗出液vs漏出液、坏死vs凋亡），请主动使用Markdown表格进行对比分析。"
-    teacher_rule = """【考点红绿灯】如果老师在录音里强调，请把核心内容按重要程度分为三级：
-🔴【必考核心】：老师明确说“必考”、“期末考”的内容。
-🟡【理解重点】：老师强调“注意”、“记住”但没有明确说必考的内容。
-⚪【了解即可】：老师随口提到的背景知识。
-格式要求：必须保留老师原意，去掉口语化废话，用 <teacher_important> 和 </teacher_important> 包裹起来。"""
-    highlight_rule = "请用 [[ ]] 把最核心的【高频考点】、【必须掌握的结论】或【关键医学名词】包裹起来。"
+    hallucination_rule = "\n【防幻觉与对比要求】1. 所有结论必须优先基于我提供的PPT文本和参考资料，若没有找到明确依据，必须加上“⚠️ 此内容为AI补充，请以教材为准”。2. 若遇到易混淆的医学名词，请主动使用Markdown表格进行对比分析。"
+
+    teacher_rule = """【绝对强制：考点红绿灯分级 + 必须打标签】
+1. 如果老师在【课堂录音/笔记】里强调了内容，必须按重要程度分为三级，并用 <teacher_important> 和 </teacher_important> 包裹起来：
+🔴【必考核心】：老师明确说“必考”、“期末考”、“重点”的内容。
+🟡【理解重点】：老师强调“注意”、“记住”、“熟练掌握”但没有明确说必考的内容。
+⚪【了解即可】：老师随口提到的背景知识、扩展阅读、了解即可的内容。
+2. 如果【课堂录音/笔记】为空，请你在提炼的PPT知识点中，找出最核心的高频考点，用 <teacher_important> 和 </teacher_important> 包裹，并用红绿灯标出级别！
+3. 所有的核心医学名词，必须用 [[ ]] 包裹！
+【死命令】绝对不允许省略 <teacher_important> 标签！必须带红绿灯！"""
 
     if mode == "解构":
-        if "临床趣味脑洞模式" in work_mode:
-            system_prompt = f"""你是三甲医院的一名资深主治医师。请根据【PPT文本】和【课堂笔记】，转化为一段风趣的“查房情景喜剧”。【创作要求】：1. 医学准确性；2. 结构化输出：🩺【临床查房情景剧】、💊【看病如破案】、🤣【记忆梗】；3. {highlight_rule}{hallucination_rule}\n{local_knowledge}{pubmed_context}\n直接输出段子！"""
-        elif "全篇融合模式" in work_mode:
-            system_prompt = f"""你是一名资深的医学学霸导师。请将【PPT文本】与【课堂录音/笔记】完美融合，整理出整章知识点复习大纲。【工作原则】：1. 全面覆盖；2. 重点凸显：{teacher_rule}；3. 深度串联：穿插“微观机制 -> 病理生理联系 -> 药理干预”；4. 保留高亮：{highlight_rule}{hallucination_rule}\n【输出格式】：多级标题和列表。若提供文献，务必加“前沿进展”。\n{local_knowledge}{pubmed_context}"""
+        if "全篇融合模式" in work_mode:
+            system_prompt = f"""你是一名资深的医学学霸导师。请将【PPT文本】与【课堂录音/笔记】完美融合，整理出整章知识点复习大纲。【工作原则】：1. 全面覆盖；2. 重点凸显：{teacher_rule}；3. 深度串联：穿插“微观机制 -> 病理生理联系 -> 药理干预”。\n【输出格式】：多级标题和列表。\n{local_knowledge}{pubmed_context}"""
         else:
             if thinking_mode and not user_feedback:
                 system_prompt = f"""你是一位医学导师。请根据以下文本内容，抛出一个临床情景题。【绝对铁律】：只输出题目，不要输出解析！直接输出题目！\n{local_knowledge}{pubmed_context}"""
             elif thinking_mode and user_feedback == "我不会":
-                system_prompt = f"""你是一位医学导师。学生表示暂时不会。请用大白话和生活化的比喻，详细拆解该知识点。\n{teacher_rule}{highlight_rule}{hallucination_rule}\n{local_knowledge}{pubmed_context}"""
+                system_prompt = f"""你是一位医学导师。学生表示暂时不会。请用大白话和生活化的比喻，详细拆解该知识点。\n{teacher_rule}\n{local_knowledge}{pubmed_context}"""
             elif thinking_mode and user_feedback == "我会了":
-                system_prompt = f"""你是一位医学导师。学生表示已经掌握该知识点。【死命令】：1. 【全局大纲】先输出【知识点大纲】！2. 【重点保留】必须保留老师强调的内容！用 <teacher_important> 标签包裹！3. 【题目分界线】大纲结束后，换行输出 === 变式题 === 。4. 【题目生成】下方直接生成 3 道变式题。第一句话必须是“第一题：...”5. 【格式要求】每道题必须是完整的选择题（含A、B、C、D四个选项）。6. 【切分规则】严格格式：'(题干+A、B、C、D)|(详细答案解析)'，用英文竖线分隔。\n{local_knowledge}{pubmed_context}"""
+                system_prompt = f"""你是一位医学导师。学生表示已经掌握该知识点。
+【死命令】：
+1. 【全局大纲】先输出【知识点大纲】！
+2. 【重点保留】必须用 <teacher_important> 标签包裹老师强调的整句原话！
+3. 【名词高亮】在输出大纲和题目时，所有的核心医学名词，必须用 [[ ]] 包裹！
+4. 【题目分界线】大纲结束后，换行输出 === 变式题 === 作为分隔符。
+5. 【防剧透限制】分隔符下方的 3 道变式题，**必须严格使用格式**：'(题干+A、B、C、D四个选项)|(详细答案解析)'，用英文竖线 `|` 分隔。**每道题必须独占一行！绝对禁止合并成一大段话！禁止输出任何题号（如1. 2.）！**\n{local_knowledge}{pubmed_context}"""
             else:
-                system_prompt = f"""你是多智能体AI导师团队。请从文本中提取核心考点。\n{teacher_rule}\n【输出结构】：🔴 必考核心（提取3-8个核心考点，详尽写出微观机制 -> 病理生理联系 -> 药理干预。）；💡 白话拆解；🧠 思维发散。\n【铁律】：必须包含以上三段！{highlight_rule}{hallucination_rule}\n{local_knowledge}{pubmed_context}"""
+                system_prompt = f"""你是多智能体AI导师团队。请从文本中提取核心考点。\n{teacher_rule}\n【输出结构】：🔴 必考核心（提取3-8个核心考点，详尽写出微观机制 -> 病理生理联系 -> 药理干预。）；💡 白话拆解；🧠 思维发散。\n【铁律】：必须包含以上三段！\n{local_knowledge}{pubmed_context}"""
     elif mode == "出题":
         system_prompt = f"你是医学出题官。请根据以下文本内容，出3道选择题。{teacher_rule}请严格使用CSV格式输出，用竖线'|'分隔。"
 
@@ -259,8 +289,11 @@ def get_knowledge_graph(topic_text):
 1. **全局总览优先**：从课件中提取出本章节的核心主干（一级节点），作为顶层骨架。
 2. **分层展开**：将每一节的核心知识点（如：机制、病理、药理）作为子节点展开。
 3. **痛点精准锚定**：如果“错题诊断”中有薄弱知识点，请必须使用菱形 A{{薄弱点}} 在全局图谱中将其标记出来！
-4. **用户焦点过滤**：如果用户输入了主题词，请在全局骨架中高亮该分支。若无输入，则输出全局框架。
-5. 代码必须严格包裹在 ```mermaid 和 ``` 之间。
+4. **Mermaid语法死命令**：
+   - 绝对不能使用中文标点符号！
+   - 节点ID用英文字母，节点名含空格或标点必须用双引号包裹（如 A["细胞膜 (结构)"]）。
+   - **在每一个分号 `;` 后面强制换行！**（这是为了渲染引擎识别，绝对不能写在一行里）
+   - 直接输出纯代码，不要解释。
 【用户输入主题（可能为空）】：{topic_text}
 【课件与错题背景】：\n{combined_context}
 直接输出 Mermaid 代码块。"""
@@ -279,11 +312,7 @@ def chat_with_ai(user_input, chat_history):
     system_prompt = f"""你是一名专业的医学AI助教。
 【参考资料】：以下是学生本次课程上传的PPT和笔记内容：
 {current_context[:4000]}
-【回答规则】：
-1. 如果提问与上述资料相关，优先基于资料回答，并指明“根据课件/笔记……”。
-2. 如果资料中没有相关内容，再基于医学知识库回答，并标注“以下内容基于通用医学知识……”。
-3. 绝对不要捏造医学事实！不知道请说明。
-4. 请用 [[ ]] 把核心的医学名词或结论标出。"""
+【回答规则】：1. 优先基于资料回答，并指明“根据课件/笔记……”。2. 如果资料中没有，再基于医学知识库回答。3. 绝对不要捏造医学事实！4. 请用 [[ ]] 把核心的医学名词或结论标出。"""
     messages = [{"role": "system", "content": system_prompt}]
     for chat in chat_history[-5:]:
         messages.append({"role": "user", "content": chat["user"]})
@@ -299,16 +328,27 @@ def chat_with_ai(user_input, chat_history):
         return f"❌ 调用出错啦：{str(e)}"
 
 
-# ==================== 8. 解析与渲染 ====================
+# ==================== 8. 解析与渲染（暴力兜底 + 清理星号） ====================
 def apply_highlight(text, hl_color, teacher_color):
-    text = text.replace("[[",
-                        f"<span style='background-color:{hl_color}; color:#000; padding:2px 4px; border-radius:4px; font-weight:bold;'>").replace(
-        "]]", "</span>")
+    text = text.replace("**", "").replace("  ", " ")
+
+    # 1. 老师强调标签优先渲染
     text = text.replace("<teacher_important>",
                         f"<span style='background-color:{teacher_color}; color:#000; padding:2px 6px; border-radius:4px; font-weight:bold;'>")
     text = text.replace("</teacher_important>", "</span>")
-    return text
 
+    # 2. 暴力正则兜底：增加大量医学老师爱用的强调词，实现整句高亮
+    # 匹配以句号、问号、感叹号、换行分隔的整句，只要句中有这些词，整句高亮
+    pattern = r'(?<!<span[^>]*>)([^。！？\n]*(?:重点|必考|考点|记住|易混淆|要考|常考|掌握|熟悉|了解|背诵|记忆|口诀|总结|注意|考点|期末|考试)[^。！？\n]*)(?!</span>)'
+    text = re.sub(pattern,
+                  f"<span style='background-color:{teacher_color}; color:#000; padding:2px 6px; border-radius:4px; font-weight:bold;'>\\1</span>",
+                  text)
+
+    # 3. 核心名词高亮 [[ ]]
+    text = text.replace("[[",
+                        f"<span style='background-color:{hl_color}; color:#000; padding:2px 4px; border-radius:4px; font-weight:bold;'>").replace(
+        "]]", "</span>")
+    return text
 
 # ==================== 9. 网页前端 ====================
 st.title("🏥 南医大医学AI学习系统")
@@ -391,9 +431,14 @@ with tab1:
                         st.write("🧠 正在准备临床思考题...")
                         result_analyze = get_ai_response(ppt_text, audio_text, "解构", work_mode, thinking_mode,
                                                          enable_pubmed=enable_pubmed)
-                        st.session_state['last_analysis'] = result_analyze
-                        st.session_state['thinking_stage'] = "awaiting_feedback"
-                        st.rerun()
+
+                        if result_analyze.startswith("⚠️") or result_analyze.startswith("❌"):
+                            st.error(result_analyze)
+                            status.update(label="生成失败，请检查网络后重试", state="error")
+                        else:
+                            st.session_state['last_analysis'] = result_analyze
+                            st.session_state['thinking_stage'] = "awaiting_feedback"
+                            st.rerun()
                     else:
                         st.write("🔍 步骤 1：正在融合分析...")
                         result_analyze = get_ai_response(ppt_text, audio_text, "解构", work_mode, thinking_mode,
@@ -438,55 +483,73 @@ with tab1:
     if st.session_state['thinking_stage'] == "done":
         st.subheader("📤 AI 解构结果")
         result = st.session_state['last_analysis']
+
         if "我会了" in st.session_state.get('user_feedback', ''):
             if "=== 变式题 ===" in result:
-                outline_part, questions_part = result.split("=== 变式题 ===", 1)
-                st.markdown("### 📖 本章节知识点大纲")
-                st.markdown(apply_highlight(outline_part.strip(), hl_core, teacher_color), unsafe_allow_html=True)
-                st.markdown("### 📝 变式训练题")
-                blocks = re.split(r'(?=第[一二三四五六七八九十0-9]+题[:：])', questions_part)
-                for block in blocks:
-                    if not block.strip(): continue
-                    if "|" in block:
-                        q, a = block.split("|", 1)
-                        st.markdown(f"**{q.strip()}**")
-                        with st.expander("🎯 点击查看答案解析（请先思考后再点开！）"):
-                            st.markdown(apply_highlight(a.strip(), hl_core, teacher_color), unsafe_allow_html=True)
-                    else:
-                        st.markdown(block.strip())
+                try:
+                    outline_part, questions_part = result.split("=== 变式题 ===", 1)
+                    st.markdown("### 📖 本章节知识点大纲")
+                    st.markdown(apply_highlight(outline_part.strip(), hl_core, teacher_color), unsafe_allow_html=True)
+                    st.markdown("### 📝 变式训练题")
+
+                    # ========== 修复：强化多题解析逻辑，支持按行切分 ==========
+                    blocks = [b for b in questions_part.split('\n') if b.strip()]
+                    if len(blocks) < 3:  # 如果AI没按行输出，尝试强行按题号切
+                        blocks = re.split(r'(?=第?\s*[0-9一二三四五]\s*[.、题])', questions_part)
+
+                    for block in blocks:
+                        if not block.strip() or len(block.strip()) < 5: continue
+                        if "|" in block:
+                            q, a = block.split("|", 1)
+                            st.markdown(f"**{q.strip()}**")
+                            with st.expander("🎯 点击查看答案解析（请先思考后再点开！）"):
+                                st.markdown(apply_highlight(a.strip(), hl_core, teacher_color), unsafe_allow_html=True)
+                        else:
+                            st.markdown(apply_highlight(block.strip(), hl_core, teacher_color), unsafe_allow_html=True)
+                except Exception:
+                    st.markdown(apply_highlight(result, hl_core, teacher_color), unsafe_allow_html=True)
             else:
                 st.markdown(apply_highlight(result, hl_core, teacher_color), unsafe_allow_html=True)
         elif "全篇融合模式" in work_mode or "临床趣味脑洞模式" in work_mode:
             st.markdown(apply_highlight(result, hl_core, teacher_color), unsafe_allow_html=True)
         else:
+            # 非深度思考模式，安全解析三段式结构
             result = result.replace("🔴【", "🔴 ").replace("💡【", "💡 ").replace("🧠【", "🧠 ").replace("】", "")
             result = result.replace("必考核心", "\n🔴 必考核心\n").replace("白话拆解", "\n💡 白话拆解\n").replace(
                 "思维发散", "\n🧠 思维发散\n")
             result = re.sub(r'(?<!\n)(\d+\.\s)', r'\n\1', result)
-            if "🔴 必考核心" in result and "💡 白话拆解" in result and "🧠 思维发散" in result:
-                parts = result.split("🔴 必考核心");
-                rest = parts[1];
-                parts = rest.split("💡 白话拆解")
-                core_text = apply_highlight(parts[0], hl_core, teacher_color);
-                rest = parts[1];
-                parts = rest.split("🧠 思维发散")
-                explain_text = apply_highlight(parts[0], hl_core, teacher_color);
-                think_text = apply_highlight(parts[1], hl_core, teacher_color)
+
+            idx1 = result.find("🔴 必考核心")
+            idx2 = result.find("💡 白话拆解")
+            idx3 = result.find("🧠 思维发散")
+
+            if idx1 != -1 and idx2 != -1 and idx3 != -1:
+                core_text = result[idx1:idx2].replace("🔴 必考核心", "").strip()
+                explain_text = result[idx2:idx3].replace("💡 白话拆解", "").strip()
+                think_text = result[idx3:].replace("🧠 思维发散", "").strip()
+
                 html_core = f"<div style='margin-top:20px; border-top:1px dashed #ccc; padding-top:10px;'><span style='background-color: {color_core}; color: #333; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 18px;'>🔴 必考核心</span></div>"
                 html_explain = f"<div style='margin-top:20px; border-top:1px dashed #ccc; padding-top:10px;'><span style='background-color: {color_explain}; color: #333; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 18px;'>💡 白话拆解</span></div>"
                 html_think = f"<div style='margin-top:20px; border-top:1px dashed #ccc; padding-top:10px;'><span style='background-color: {color_think}; color: #333; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 18px;'>🧠 思维发散</span></div>"
-                result = html_core + core_text + html_explain + explain_text + html_think + think_text
+                result = html_core + apply_highlight(core_text, hl_core,
+                                                     teacher_color) + html_explain + apply_highlight(explain_text,
+                                                                                                     hl_core,
+                                                                                                     teacher_color) + html_think + apply_highlight(
+                    think_text, hl_core, teacher_color)
+            else:
+                result = apply_highlight(result, hl_core, teacher_color)
+
             st.markdown(f"<div style='font-size:17px; line-height:1.9;'>{result}</div>", unsafe_allow_html=True)
 
         st.download_button("📄 导出本次知识点大纲 (Markdown)", data=st.session_state['last_analysis'],
                            file_name=f"{course}_知识点大纲.md", mime="text/markdown", use_container_width=True)
 
         if st.button("🔄 结束本次学习，返回初始状态"):
-            st.session_state['thinking_stage'] = "idle";
-            st.session_state['user_feedback'] = "";
-            st.session_state['last_analysis'] = "";
+            st.session_state['thinking_stage'] = "idle"
+            st.session_state['user_feedback'] = ""
+            st.session_state['last_analysis'] = ""
             st.rerun()
-        st.divider();
+        st.divider()
         st.subheader("🎯 Anki 卡片下载")
         if "last_anki" in st.session_state and "|" in st.session_state['last_anki']:
             apkg_file = generate_apkg(st.session_state['last_anki'])
@@ -554,12 +617,68 @@ with tab3:
             graph_result = get_knowledge_graph(user_topic)
             st.subheader("🌐 综合知识网络图")
 
-            if HAS_MERMAID:
-                mermaid_code = graph_result.replace("```mermaid", "").replace("```", "").strip()
-                st_mermaid(mermaid_code, height="500px")
-            else:
-                st.info("💡 复制下方代码，粘贴到 mermaid.live 中查看高清图表！薄弱知识点已用特殊形状标出。")
-                st.code(graph_result, language="markdown")
+            mermaid_code = graph_result.replace("```mermaid", "").replace("```", "").strip()
+            mermaid_code = mermaid_code.replace(";", ";\n")
+
+            # ========== 修复：全屏查看 + 一键跳转 Mermaid Live ==========
+            mermaid_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+                <style>
+                    body {{ margin: 0; padding: 0; overflow: hidden; background: #fff; }}
+                    #container {{
+                        width: 100%; height: 100vh; overflow: auto;
+                        cursor: grab; background: #fff;
+                    }}
+                    #container:active {{ cursor: grabbing; }}
+                    .mermaid {{ min-width: 2500px; padding: 40px; }}
+                </style>
+            </head>
+            <body>
+                <div id="container">
+                    <pre class="mermaid">
+                        {mermaid_code}
+                    </pre>
+                </div>
+                <script>
+                    mermaid.initialize({{ startOnLoad: true, securityLevel: 'loose', theme: 'base', themeVariables: {{ fontSize: '16px' }} }});
+                    const container = document.getElementById('container');
+                    let isDown = false;
+                    let startX, scrollLeft;
+                    container.addEventListener('mousedown', (e) => {{ isDown = true; startX = e.pageX - container.offsetLeft; scrollLeft = container.scrollLeft; }});
+                    container.addEventListener('mouseleave', () => {{ isDown = false; }});
+                    container.addEventListener('mouseup', () => {{ isDown = false; }});
+                    container.addEventListener('mousemove', (e) => {{
+                        if (!isDown) return;
+                        e.preventDefault();
+                        const x = e.pageX - container.offsetLeft;
+                        const walk = (x - startX) * 2;
+                        container.scrollLeft = scrollLeft - walk;
+                    }});
+                </script>
+            </body>
+            </html>
+            """
+            try:
+                components.html(mermaid_html, height=800, scrolling=True)
+                st.caption("💡 鼠标按住图谱可以上下左右拖拽！如果图片仍显示不全，请点击下方按钮全屏查看。")
+
+                # 生成 Mermaid Live 带代码的 URL
+                import base64
+
+                b64_code = base64.urlsafe_b64encode(mermaid_code.encode('utf-8')).decode('utf-8')
+                live_url = f"https://mermaid.live/edit#base64:{b64_code}"
+                st.link_button("🌐 在新标签页全屏查看图谱（自动加载代码）", live_url)
+
+                with st.expander("查看 Mermaid 源码 / 备用渲染链接"):
+                    st.code(mermaid_code, language="markdown")
+                    st.link_button("🔗 点击前往 Mermaid Live 渲染器 (免费)", "https://mermaid.live/")
+            except Exception as e:
+                st.error("⚠️ 图像渲染失败，正在为您切换至备用方案...")
+                st.code(mermaid_code, language="markdown")
+                st.link_button("🔗 点击前往 Mermaid Live 渲染器 (免费)", "https://mermaid.live/")
 
 with tab4:
     st.subheader("📕 我的错题本")
