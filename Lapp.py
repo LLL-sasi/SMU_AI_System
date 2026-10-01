@@ -15,13 +15,17 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 import pdfplumber
 from docx import Document
+from openai import OpenAI
 
 # ==================== 1. 配置 API ====================
-# 替换为云端安全读取
 DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+
 ZHIPU_API_KEY = st.secrets.get("ZHIPU_API_KEY", "")
 ZHIPU_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+SILICONFLOW_API_KEY = st.secrets.get("SILICONFLOW_API_KEY", "")
+
 # ==================== 2. 状态初始化 ====================
 if 'last_analysis' not in st.session_state: st.session_state['last_analysis'] = ""
 if 'last_mistake_diagnosis' not in st.session_state: st.session_state['last_mistake_diagnosis'] = ""
@@ -61,7 +65,6 @@ def generate_apkg(csv_text):
                                              'afmt': '{{FrontSide}}<hr id="answer">{{Back}}'}])
         my_deck = genanki.Deck(2059400110, 'SMU_AI_Medical_Deck')
         valid_cards = 0
-        # 按行分割，每行一张卡片
         for line in csv_text.strip().split('\n'):
             if "|" not in line: continue
             parts = line.split('|', 1)
@@ -328,7 +331,35 @@ def chat_with_ai(user_input, chat_history):
         return f"❌ 调用出错啦：{str(e)}"
 
 
-# ==================== 8. 解析与渲染（暴力兜底 + 清理星号） ====================
+# ==================== 8. 录音转写模块（硅基流动 Whisper） ====================
+def transcribe_audio_file(uploaded_audio):
+    """上传音频 → 调用 Whisper API → 返回文字稿"""
+    if uploaded_audio is None:
+        return None
+
+    temp_path = "temp_audio.mp3"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_audio.getbuffer())
+
+    try:
+        client = OpenAI(
+            api_key=SILICONFLOW_API_KEY,
+            base_url="https://api.siliconflow.cn/v1"
+        )
+        with open(temp_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="FunAudioLLM/SenseVoiceSmall",
+                file=audio_file
+            )
+        return transcript.text
+    except Exception as e:
+        return f"⚠️ 转写失败：{str(e)}"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+# ==================== 9. 解析与渲染（暴力兜底 + 清理星号） ====================
 def apply_highlight(text, hl_color, teacher_color):
     text = text.replace("**", "").replace("  ", " ")
 
@@ -338,7 +369,6 @@ def apply_highlight(text, hl_color, teacher_color):
     text = text.replace("</teacher_important>", "</span>")
 
     # 2. 暴力正则兜底：增加大量医学老师爱用的强调词，实现整句高亮
-    # 匹配以句号、问号、感叹号、换行分隔的整句，只要句中有这些词，整句高亮
     pattern = r'(?<!<span[^>]*>)([^。！？\n]*(?:重点|必考|考点|记住|易混淆|要考|常考|掌握|熟悉|了解|背诵|记忆|口诀|总结|注意|考点|期末|考试)[^。！？\n]*)(?!</span>)'
     text = re.sub(pattern,
                   f"<span style='background-color:{teacher_color}; color:#000; padding:2px 6px; border-radius:4px; font-weight:bold;'>\\1</span>",
@@ -350,7 +380,8 @@ def apply_highlight(text, hl_color, teacher_color):
         "]]", "</span>")
     return text
 
-# ==================== 9. 网页前端 ====================
+
+# ==================== 10. 网页前端 ====================
 st.title("🏥 南医大医学AI学习系统")
 st.caption("基于多智能体协作与课堂语境融合的启发式学习平台 | 内测版")
 st.info("👋 欢迎使用！请在左侧上传PPT或笔记，然后点击下方的‘一键全自动完成’按钮开始体验。新手请点左侧【使用指南】。")
@@ -358,8 +389,22 @@ st.info("👋 欢迎使用！请在左侧上传PPT或笔记，然后点击下方
 with st.sidebar:
     st.header("📥 数据导入")
     uploaded_ppt = st.file_uploader("① 上传PPT/教材", type=['pptx', 'pdf', 'txt'])
-    uploaded_audio = st.file_uploader("② 上传音频（待接入Whisper）", type=['mp3', 'wav', 'm4a'], disabled=True)
-    st.caption("音频转文字：请先用飞书妙记/通义听悟导出为Word/TXT，再使用下方通道③上传。")
+
+    # ========== 修改：录音转写模块 ==========
+    uploaded_audio = st.file_uploader("② 上传课堂录音（MP3/WAV/M4A）", type=['mp3', 'wav', 'm4a'])
+    if uploaded_audio is not None:
+        if st.button("🎙️ 一键转写录音", use_container_width=True):
+            with st.spinner("正在转写中，请稍候..."):
+                result = transcribe_audio_file(uploaded_audio)
+                if result and not result.startswith("⚠️"):
+                    st.session_state['parsed_note_text'] = result
+                    st.success("✅ 转写成功！文字稿已自动填入下方输入框。")
+                    st.rerun()
+                else:
+                    st.error(result or "转写失败，请重试。")
+    st.caption("音频转文字：也可先用飞书妙记/通义听悟导出为TXT，再使用下方通道③上传。")
+    # ========================================
+
     uploaded_doc = st.file_uploader("③ 上传课堂笔记/逐字稿（Word/TXT/PDF）", type=['docx', 'txt', 'pdf'])
     st.divider()
 
@@ -492,9 +537,8 @@ with tab1:
                     st.markdown(apply_highlight(outline_part.strip(), hl_core, teacher_color), unsafe_allow_html=True)
                     st.markdown("### 📝 变式训练题")
 
-                    # ========== 修复：强化多题解析逻辑，支持按行切分 ==========
                     blocks = [b for b in questions_part.split('\n') if b.strip()]
-                    if len(blocks) < 3:  # 如果AI没按行输出，尝试强行按题号切
+                    if len(blocks) < 3:
                         blocks = re.split(r'(?=第?\s*[0-9一二三四五]\s*[.、题])', questions_part)
 
                     for block in blocks:
@@ -513,7 +557,6 @@ with tab1:
         elif "全篇融合模式" in work_mode or "临床趣味脑洞模式" in work_mode:
             st.markdown(apply_highlight(result, hl_core, teacher_color), unsafe_allow_html=True)
         else:
-            # 非深度思考模式，安全解析三段式结构
             result = result.replace("🔴【", "🔴 ").replace("💡【", "💡 ").replace("🧠【", "🧠 ").replace("】", "")
             result = result.replace("必考核心", "\n🔴 必考核心\n").replace("白话拆解", "\n💡 白话拆解\n").replace(
                 "思维发散", "\n🧠 思维发散\n")
@@ -620,7 +663,6 @@ with tab3:
             mermaid_code = graph_result.replace("```mermaid", "").replace("```", "").strip()
             mermaid_code = mermaid_code.replace(";", ";\n")
 
-            # ========== 修复：全屏查看 + 一键跳转 Mermaid Live ==========
             mermaid_html = f"""
             <!DOCTYPE html>
             <html>
@@ -664,9 +706,6 @@ with tab3:
             try:
                 components.html(mermaid_html, height=800, scrolling=True)
                 st.caption("💡 鼠标按住图谱可以上下左右拖拽！如果图片仍显示不全，请点击下方按钮全屏查看。")
-
-                # 生成 Mermaid Live 带代码的 URL
-                import base64
 
                 b64_code = base64.urlsafe_b64encode(mermaid_code.encode('utf-8')).decode('utf-8')
                 live_url = f"https://mermaid.live/edit#base64:{b64_code}"
