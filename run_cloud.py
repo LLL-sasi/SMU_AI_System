@@ -10,7 +10,7 @@ import io
 import concurrent.futures
 from PIL import Image
 import genanki
-from datetime import datetime, date
+from datetime import datetime
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 import pdfplumber
@@ -36,7 +36,7 @@ if 'last_anki' not in st.session_state: st.session_state['last_anki'] = ""
 if 'mistake_book' not in st.session_state: st.session_state['mistake_book'] = []
 
 
-# ==================== 3. 数据存储机制（本地会话版） ====================
+# ==================== 3. 数据存储机制（云端内存版） ====================
 def load_mistakes(): return st.session_state['mistake_book']
 
 
@@ -148,7 +148,7 @@ def extract_text_from_file(uploaded_file):
     return ""
 
 
-# ==================== 6. 核心 AI 处理 ====================
+# ==================== 6. 核心 AI 处理（保留全量模式） ====================
 def call_deepseek(system_prompt, user_input, temperature=0.4, max_tokens=4000):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
     data = {"model": "deepseek-chat",
@@ -162,19 +162,20 @@ def call_deepseek(system_prompt, user_input, temperature=0.4, max_tokens=4000):
         return f"⚠️ 系统繁忙或网络错误：{str(e)}"
 
 
-def get_ai_response(ppt_text, audio_text, mode, work_mode="微观伴读模式", thinking_mode=True,
-                    user_feedback="", enable_pubmed=False):
+def get_ai_response(ppt_text, audio_text, mode, work_mode="微观伴读模式", thinking_mode=True, user_feedback="",
+                    enable_pubmed=False):
     combined_input = f"【PPT文本】\n{ppt_text}\n\n【课堂笔记】\n{audio_text}"
-
     teacher_rule = """【红黄绿灯分级】
-🔴【必考核心】：老师明确说"必考"的内容。
-🟡【理解重点】：老师强调"注意、记住"的内容。
+🔴【必考核心】：老师明确说“必考”的内容。
+🟡【理解重点】：老师强调“注意、记住”的内容。
 ⚪【了解即可】：背景知识。
 所有核心医学名词必须用 [[ ]] 包裹！"""
 
     if mode == "解构":
         if "全篇融合模式" in work_mode:
             system_prompt = f"你是一名医学导师。请融合PPT和笔记，整理复习大纲。\n{teacher_rule}"
+        elif "课前预习模式" in work_mode:
+            system_prompt = f"你是一位医学预习导师。生成【课前预习任务单】：核心概念地图、预习重点预警、预习思考题。\n{teacher_rule}"
         else:
             if thinking_mode and not user_feedback:
                 system_prompt = "你是一位医学导师。请抛出一个临床情景题。只输出题目，不输出解析。"
@@ -187,7 +188,7 @@ def get_ai_response(ppt_text, audio_text, mode, work_mode="微观伴读模式", 
     elif mode == "出题":
         system_prompt = f"你是医学出题官。出3道选择题。{teacher_rule}必须用竖线'|'分隔。"
 
-    return call_deepseek(system_prompt, combined_input, temperature=0.4)
+    return call_deepseek(system_prompt, combined_input, temperature=0.8 if "临床趣味" in work_mode else 0.4)
 
 
 def get_diagnose_with_context(question_text, image_base64=None):
@@ -229,7 +230,7 @@ def apply_highlight(text, hl_color="#FFEB3B", teacher_color="#FFCDD2"):
     return text
 
 
-# ==================== 8. 网页前端 ====================
+# ==================== 8. 网页前端（保留完整UI） ====================
 st.title("🏥 南医大医学AI学习系统（云端测试版）")
 st.caption("基于多智能体协作 + 云端DeepSeek API | 内测版")
 st.info("👋 欢迎使用！请在左侧上传PPT或笔记，然后点击下方的'一键全自动完成'按钮开始体验。")
@@ -239,6 +240,13 @@ with st.sidebar:
     uploaded_ppt = st.file_uploader("① 上传PPT/教材", type=['pptx', 'pdf', 'txt'])
     uploaded_doc = st.file_uploader("③ 上传课堂笔记/逐字稿", type=['docx', 'txt', 'pdf'])
     st.divider()
+
+    st.header("⚙️ 系统设置")
+    course = st.selectbox("当前课程", ["细胞生物学", "系统解剖学", "病理学"])
+    work_mode = st.radio("选择智能体工作模式",
+                         ["📖 微观伴读模式", "🏛️ 全篇融合模式", "🩺 临床趣味脑洞模式", "🎯 课前预习模式"])
+    thinking_mode = st.toggle("🧠 开启深度思考模式（先思考后看答案）", value=True)
+    st.success("系统状态：Ready")
 
 if uploaded_ppt is not None:
     if st.session_state.get('last_uploaded_ppt') != uploaded_ppt.name:
@@ -269,20 +277,43 @@ with tab1:
                 st.warning("请先输入内容！")
             else:
                 with st.status("AI导师团队处理中...", expanded=True) as status:
-                    result = get_ai_response(ppt_text, audio_text, "解构", "微观伴读模式", False, enable_pubmed=False)
-                    st.session_state['last_analysis'] = result
-                    st.session_state['thinking_stage'] = "done"
-                    st.rerun()
+                    result = get_ai_response(ppt_text, audio_text, "解构", work_mode, thinking_mode,
+                                             enable_pubmed=False)
+                    if result.startswith("⚠️") or result.startswith("❌"):
+                        st.error(result)
+                    else:
+                        st.session_state['last_analysis'] = result
+                        st.session_state['thinking_stage'] = "awaiting_feedback"
+                        st.rerun()
+    elif st.session_state['thinking_stage'] == "awaiting_feedback":
+        st.subheader("🧠 临床思考题")
+        st.info(st.session_state['last_analysis'])
+        col_fb1, col_fb2 = st.columns(2)
+        if col_fb1.button("✅ 我会了（挑战高阶题）", use_container_width=True):
+            st.session_state['user_feedback'] = "我会了"
+            with st.spinner("正在生成高阶变式题..."):
+                result = get_ai_response(ppt_text, audio_text, "解构", work_mode, thinking_mode, "我会了")
+                st.session_state['last_analysis'] = result
+                st.session_state['thinking_stage'] = "done"
+                st.rerun()
+        if col_fb2.button("❌ 我不会（降维讲解）", use_container_width=True):
+            st.session_state['user_feedback'] = "我不会"
+            with st.spinner("正在生成基础解析..."):
+                result = get_ai_response(ppt_text, audio_text, "解构", work_mode, thinking_mode, "我不会")
+                st.session_state['last_analysis'] = result
+                st.session_state['thinking_stage'] = "done"
+                st.rerun()
+
     elif st.session_state['thinking_stage'] == "done":
         st.subheader("📤 AI 解构结果")
         res = st.session_state['last_analysis']
         st.markdown(apply_highlight(res), unsafe_allow_html=True)
-
         st.download_button("📄 下载 Markdown 文件", data=res,
                            file_name=f"医学知识点_{datetime.now().strftime('%Y%m%d')}.md", mime="text/markdown")
 
-        if st.button("🔄 结束本次学习"):
+        if st.button("🔄 结束本次学习，返回初始状态"):
             st.session_state['thinking_stage'] = "idle"
+            st.session_state['user_feedback'] = ""
             st.session_state['last_analysis'] = ""
             st.rerun()
 
